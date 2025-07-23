@@ -1,0 +1,178 @@
+import json
+import os
+import time
+from datetime import datetime
+from scapy.all import ARP, Ether, srp
+import requests
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import csv
+from io import StringIO
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('network_scan.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Путь к локальной базе OUI и параметры
+OUI_FILE = "oui.json"
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+OUI_UPDATE_INTERVAL = 30 * 24 * 60 * 60  # 30 дней в секундах
+MIN_OUI_ENTRIES = 10000  # Минимальное количество записей в базе OUI
+API_RETRY_ATTEMPTS = 3  # Количество повторных попыток для API
+API_DELAY = 0.5  # Задержка 0.5 секунды для соблюдения лимита 2 запроса/сек
+
+
+def load_oui_database():
+    """Загружает локальную базу OUI или скачивает новую, если она устарела или повреждена."""
+    if os.path.exists(OUI_FILE):
+        file_mtime = os.path.getmtime(OUI_FILE)
+        if time.time() - file_mtime < OUI_UPDATE_INTERVAL:
+            try:
+                with open(OUI_FILE, 'r', encoding='utf-8') as f:
+                    oui_database = json.load(f)
+                if len(oui_database) >= MIN_OUI_ENTRIES:
+                    logger.info(f"Использование существующей базы OUI ({len(oui_database)} записей)")
+                    return oui_database
+                else:
+                    logger.warning(f"Локальная база OUI содержит слишком мало записей ({len(oui_database)})")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки локальной базы OUI: {e}")
+
+    logger.info("Скачивание новой базы OUI...")
+    try:
+        response = requests.get(OUI_URL, timeout=10)
+        response.raise_for_status()
+        csv_data = StringIO(response.text)
+        reader = csv.DictReader(csv_data)
+        oui_database = {}
+        for row in reader:
+            oui = row['Assignment'].lower()  # Формат без двоеточий
+            oui_database[oui] = row['Organization Name']
+
+        if len(oui_database) < MIN_OUI_ENTRIES:
+            logger.error(f"Скачанная база OUI содержит слишком мало записей ({len(oui_database)})")
+            return oui_database
+
+        with open(OUI_FILE, 'w', encoding='utf-8') as f:
+            json.dump(oui_database, f, ensure_ascii=False)
+        logger.info(f"База OUI успешно обновлена и сохранена ({len(oui_database)} записей)")
+        return oui_database
+    except requests.RequestException as e:
+        logger.error(f"Ошибка при скачивании базы OUI: {e}")
+        return {}
+
+
+def get_mac_vendor(mac_address, oui_database):
+    """Определяет производителя по MAC-адресу, используя локальную базу или API."""
+    oui = mac_address[:8].replace(':', '').lower()  # Удаляем двоеточия для соответствия базе
+    if oui in oui_database:
+        logger.info(f"Производитель для MAC {mac_address} найден в локальной базе")
+        return oui_database[oui]
+
+    logger.info(f"Производитель для MAC {mac_address} не найден в локальной базе, запрос к API")
+    # Попытка через macvendors.com с учетом лимита 2 запроса/сек
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            url = f"https://api.macvendors.com/{mac_address}"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                time.sleep(API_DELAY)  # Задержка для соблюдения лимита
+                return response.text.strip()
+            elif response.status_code == 429:
+                logger.warning(f"Попытка {attempt + 1}: Превышен лимит запросов к macvendors.com для MAC {mac_address}")
+                time.sleep(API_DELAY * (attempt + 1))  # Увеличиваем задержку при повторе
+            else:
+                logger.warning(
+                    f"Попытка {attempt + 1}: Не удалось определить производителя для MAC {mac_address} через macvendors.com (код: {response.status_code})")
+        except requests.RequestException as e:
+            logger.error(f"Попытка {attempt + 1}: Ошибка запроса к macvendors.com для MAC {mac_address}: {e}")
+        time.sleep(API_DELAY)  # Задержка перед следующей попыткой
+
+    # Резервный API (maclookup.app)
+    try:
+        url = f"https://api.maclookup.app/v2/macs/{mac_address}"
+        response = requests.get(url, timeout=10)
+        time.sleep(API_DELAY)  # Задержка для единообразия
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('company', 'Unknown')
+        logger.warning(f"Не удалось определить производителя для MAC {mac_address} через maclookup.app")
+    except requests.RequestException as e:
+        logger.error(f"Ошибка запроса к maclookup.app для MAC {mac_address}: {e}")
+
+    return "Unknown"
+
+
+def scan_network(ip_range):
+    """Сканирует сеть для получения IP и MAC-адресов."""
+    logger.info(f"Начало сканирования сети {ip_range}")
+    arp = ARP(pdst=ip_range)
+    ether = Ether(dst="ff:ff:ff:ff:ff:ff")  # Широковещательный MAC
+    packet = ether / arp
+    try:
+        result = srp(packet, timeout=2, verbose=False, multi=True)[0]
+    except Exception as e:
+        logger.error(f"Ошибка при сканировании сети: {e}")
+        return []
+
+    devices = []
+    for sent, received in result:
+        devices.append({"ip": received.psrc, "mac": received.hwsrc})
+        logger.info(f"Обнаружено устройство: IP = {received.psrc}, MAC = {received.hwsrc}")
+
+    logger.info(f"Сканирование завершено. Найдено устройств: {len(devices)}")
+    return devices
+
+
+def process_vendor(device, oui_database):
+    """Обрабатывает MAC-адрес устройства для определения производителя."""
+    vendor = get_mac_vendor(device["mac"], oui_database)
+    logger.info(f"MAC {device['mac']} -> Производитель: {vendor}")
+    return vendor
+
+
+def main():
+    ip_range = "192.168.159.0/24"
+
+    # Загрузка или обновление базы OUI
+    oui_database = load_oui_database()
+
+    # Сканирование сети
+    devices = scan_network(ip_range)
+
+    # Параллельная обработка запросов к API с учетом лимита
+    vendor_count = {}
+    with ThreadPoolExecutor(max_workers=2) as executor:  # Ограничиваем до 2 потоков для API
+        vendors = list(executor.map(lambda d: process_vendor(d, oui_database), devices))
+
+    for vendor in vendors:
+        if vendor in vendor_count:
+            vendor_count[vendor] += 1
+        else:
+            vendor_count[vendor] = 1
+
+    result = {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "vendors": [
+            {"vendor": vendor, "count": count}
+            for vendor, count in vendor_count.items()
+        ]
+    }
+
+    try:
+        with open("network_scan_results.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=4, ensure_ascii=False)
+        logger.info("Результаты сохранены в network_scan_results.json")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении результатов: {e}")
+
+
+if __name__ == "__main__":
+    main()

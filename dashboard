@@ -1,0 +1,34 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Отчет по аномалиям</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <h2>Анализ за: 2025-07-23 18:17:30</h2>
+    <canvas id="vendorChart" width="800" height="400"></canvas>
+
+    <h3>Аномальные подсети:</h3>
+    <ul>
+        
+    </ul>
+
+    <h3>Детали по производителям:</h3>
+    <table border="1" cellpadding="5">
+        <tr>
+            <th>Производитель</th>
+            <th>Количество</th>
+            <th>Частота</th>
+            <th>Статус</th>
+        </tr>
+        <tr><td>Ubiquiti Inc</td><td>7</td><td>0.0636</td><td>typical</td></tr><tr><td>Hewlett Packard</td><td>14</td><td>0.1273</td><td>typical</td></tr><tr><td>ASUSTek COMPUTER INC.</td><td>11</td><td>0.1</td><td>typical</td></tr><tr><td>Micro-Star INTL CO., LTD.</td><td>7</td><td>0.0636</td><td>typical</td></tr><tr><td>HP Inc.</td><td>7</td><td>0.0636</td><td>typical</td></tr><tr><td>REALTEK SEMICONDUCTOR CORP.</td><td>7</td><td>0.0636</td><td>typical</td></tr><tr><td>Wistron InfoComm(Kunshan)Co.,Ltd.</td><td>7</td><td>0.0636</td><td>typical</td></tr><tr><td>Proxmox Server Solutions GmbH</td><td>21</td><td>0.1909</td><td>typical</td></tr><tr><td>Super Micro Computer, Inc.</td><td>14</td><td>0.1273</td><td>typical</td></tr><tr><td>Routerboard.com</td><td>15</td><td>0.1364</td><td>typical</td></tr>
+    </table>
+
+    <script>
+        const config = {"type": "bar", "data": {"labels": ["Ubiquiti Inc", "Hewlett Packard", "ASUSTek COMPUTER INC.", "Micro-Star INTL CO., LTD.", "HP Inc.", "REALTEK SEMICONDUCTOR CORP.", "Wistron InfoComm(Kunshan)Co.,Ltd.", "Proxmox Server Solutions GmbH", "Super Micro Computer, Inc.", "Routerboard.com"], "datasets": [{"label": "Количество устройств по производителям", "data": [7, 14, 11, 7, 7, 7, 7, 21, 14, 15], "backgroundColor": ["#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745"], "borderColor": ["#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745", "#28a745"], "borderWidth": 1}]}, "options": {"scales": {"y": {"beginAtZero": true, "title": {"display": true, "text": "Количество устройств"}}, "x": {"title": {"display": true, "text": "Производители"}, "ticks": {"autoSkip": false, "maxRotation": 45, "minRotation": 45}}}, "plugins": {"legend": {"display": true}, "title": {"display": true, "text": "Анализ производителей за последние 24 часа"}, "datalabels": {"anchor": "end", "align": "top", "formatter": "Math.round", "font": {"weight": "bold"}}}}};
+        new Chart(document.getElementById('vendorChart'), config);
+    </script>
+</body>
+</html>

@@ -1,0 +1,255 @@
+import json
+import os
+from datetime import datetime, timedelta
+import logging
+
+import matplotlib.pyplot as plt
+
+import matplotlib.pyplot as plt
+
+def save_bar_chart_png(analysis_results, analysis_datetime):
+    if not analysis_results:
+        logger.warning("Нет данных для построения графика. Пропускаем визуализацию.")
+        return None
+
+    labels = [res['vendor'] for res in analysis_results]
+    counts = [res['total_count'] for res in analysis_results]
+    colors = ['red' if res['status'] == 'anomalous' else 'green' for res in analysis_results]
+    timestamp_str = analysis_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(labels, counts, color=colors)
+    plt.xlabel("Производители")
+    plt.ylabel("Количество устройств")
+    plt.title(f"Анализ производителей за последние 24 часа\n {timestamp_str}")
+    plt.xticks(rotation=45, ha='right')
+
+    # Подписи значений над столбцами
+    for bar in bars:
+        height = bar.get_height()
+        plt.annotate(f'{int(height)}',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3),
+                     textcoords="offset points",
+                     ha='center', va='bottom')
+
+    # Добавляем отметку времени внизу справа
+
+    plt.figtext(0.99, 0.01, f"Анализ выполнен: {timestamp_str}",
+                horizontalalignment='right', fontsize=8, color='gray')
+
+    plt.tight_layout()
+
+    filename = f"anomaly_chart_{analysis_datetime.strftime('%Y%m%d_%H%M%S')}.png"
+    plt.savefig(filename)
+    plt.close()
+    logger.info(f"Визуализация сохранена в {filename}")
+
+    return filename
+
+
+
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('anomaly_analysis.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+RESULTS_FILE = "network_scan_results.json"
+ANOMALY_THRESHOLD = 0.05  # 5%
+OUTPUT_FILE = "anomaly_report.json"
+ANALYSIS_PERIOD = 24 * 60 * 60  # 24 часа
+
+
+def load_results():
+    if not os.path.exists(RESULTS_FILE):
+        logger.error(f"Файл {RESULTS_FILE} не найден")
+        return []
+
+    try:
+        with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+        if not isinstance(results, list):
+            results = [results]
+        logger.info(f"Загружено {len(results)} записей из {RESULTS_FILE}")
+        return results
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка декодирования JSON в {RESULTS_FILE}: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки {RESULTS_FILE}: {e}")
+    return []
+
+
+def filter_last_24_hours(results):
+    cutoff_time = datetime.now() - timedelta(seconds=ANALYSIS_PERIOD)
+    filtered_results = []
+    for result in results:
+        date_str = result.get('date')
+        if not date_str:
+            logger.warning("Пропущена запись без даты")
+            continue
+        try:
+            record_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            if record_time >= cutoff_time:
+                filtered_results.append(result)
+        except ValueError:
+            logger.warning(f"Неверный формат даты: {date_str}, пропускаем запись")
+    logger.info(f"Найдено {len(filtered_results)} записей за последние 24 часа")
+    return filtered_results
+
+
+def analyze_vendors(results):
+    if not results:
+        logger.warning("Нет данных для анализа")
+        return [], []
+
+    vendor_frequency = {}
+    vendor_subnets = {}
+
+    for result in results:
+        vendors = result.get('vendors', [])
+        if not isinstance(vendors, list):
+            logger.warning("Поле 'vendors' не список, пропускаем запись")
+            continue
+        for vendor_entry in vendors:
+            vendor = vendor_entry.get('vendor')
+            count = vendor_entry.get('count', 0)
+            subnets = vendor_entry.get('subnets', {})
+
+            if not vendor:
+                logger.warning("Отсутствует поле 'vendor' в записи, пропускаем")
+                continue
+            if not isinstance(subnets, dict):
+                subnets = {}
+
+            vendor_frequency[vendor] = vendor_frequency.get(vendor, 0) + count
+
+            if vendor not in vendor_subnets:
+                vendor_subnets[vendor] = set()
+
+            for subnet, subnet_count in subnets.items():
+                if subnet_count > 0:
+                    vendor_subnets[vendor].add(subnet)
+
+    total_devices = sum(vendor_frequency.values())
+    analysis_results = []
+    anomalous_subnets = set()
+
+    for vendor, count in vendor_frequency.items():
+        frequency = count / total_devices if total_devices else 0
+        is_anomalous = frequency < ANOMALY_THRESHOLD
+        analysis_results.append({
+            "vendor": vendor,
+            "total_count": count,
+            "frequency": round(frequency, 4),
+            "status": "anomalous" if is_anomalous else "typical",
+            "subnets": sorted(vendor_subnets[vendor])
+        })
+        if is_anomalous:
+            anomalous_subnets.update(vendor_subnets[vendor])
+
+    logger.info(f"Проанализировано {len(vendor_frequency)} производителей")
+    if anomalous_subnets:
+        logger.info(f"Аномалии обнаружены в подсетях: {', '.join(sorted(anomalous_subnets))}")
+    else:
+        logger.info("Аномалии не обнаружены")
+
+    return analysis_results, sorted(anomalous_subnets)
+
+
+def create_visualization(analysis_results):
+    labels = [result['vendor'] for result in analysis_results]
+    data = [result['total_count'] for result in analysis_results]
+    colors = ['#dc3545' if result['status'] == 'anomalous' else '#28a745' for result in analysis_results]
+
+    chart_config = {
+        "type": "bar",
+        "data": {
+            "labels": labels,
+            "datasets": [{
+                "label": "Количество устройств по производителям",
+                "data": data,
+                "backgroundColor": colors,
+                "borderColor": colors,
+                "borderWidth": 1
+            }]
+        },
+        "options": {
+            "scales": {
+                "y": {
+                    "beginAtZero": True,
+                    "title": {
+                        "display": True,
+                        "text": "Количество устройств"
+                    }
+                },
+                "x": {
+                    "title": {
+                        "display": True,
+                        "text": "Производители"
+                    },
+                    "ticks": {
+                        "autoSkip": False,
+                        "maxRotation": 45,
+                        "minRotation": 45
+                    }
+                }
+            },
+            "plugins": {
+                "legend": {
+                    "display": True
+                },
+                "title": {
+                    "display": True,
+                    "text": "Анализ производителей за последние 24 часа"
+                },
+                "datalabels": {
+                    "anchor": "end",
+                    "align": "top",
+                    "formatter": "Math.round",
+                    "font": {
+                        "weight": "bold"
+                    }
+                }
+            }
+        }
+    }
+
+    logger.info("Создана конфигурация для визуализации")
+    return chart_config
+
+
+def save_analysis_report(analysis_results, anomalous_subnets, chart_config):
+    report = {
+        "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "anomalous_subnets": anomalous_subnets,
+        "results": analysis_results,
+        "visualization": chart_config
+    }
+    try:
+        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=4, ensure_ascii=False)
+        logger.info(f"Отчет сохранен в {OUTPUT_FILE}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении отчета: {e}")
+
+def main():
+    results = load_results()
+    recent_results = filter_last_24_hours(results)
+    analysis_results, anomalous_subnets = analyze_vendors(recent_results)
+
+    analysis_datetime = datetime.now()
+
+    # Генерация PNG-графика с отметкой времени в имени и на изображении
+    save_bar_chart_png(analysis_results, analysis_datetime)
+
+    chart_config = create_visualization(analysis_results)
+    save_analysis_report(analysis_results, anomalous_subnets, chart_config)
+
+if __name__ == "__main__":
+    main()

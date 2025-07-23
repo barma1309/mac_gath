@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from scapy.all import ARP, Ether, srp
 import requests
 import logging
@@ -27,6 +27,8 @@ OUI_UPDATE_INTERVAL = 30 * 24 * 60 * 60  # 30 дней в секундах
 MIN_OUI_ENTRIES = 10000  # Минимальное количество записей в базе OUI
 API_RETRY_ATTEMPTS = 3  # Количество повторных попыток для API
 API_DELAY = 0.5  # Задержка 0.5 секунды для соблюдения лимита 2 запроса/сек
+RESULTS_FILE = "network_scan_results.json"
+RETENTION_PERIOD = 60 * 24 * 60 * 60  # 60 дней в секундах
 
 
 def load_oui_database():
@@ -53,7 +55,7 @@ def load_oui_database():
         reader = csv.DictReader(csv_data)
         oui_database = {}
         for row in reader:
-            oui = row['Assignment'].lower()  # Формат без двоеточий
+            oui = row['Assignment'].lower()
             oui_database[oui] = row['Organization Name']
 
         if len(oui_database) < MIN_OUI_ENTRIES:
@@ -71,35 +73,33 @@ def load_oui_database():
 
 def get_mac_vendor(mac_address, oui_database):
     """Определяет производителя по MAC-адресу, используя локальную базу или API."""
-    oui = mac_address[:8].replace(':', '').lower()  # Удаляем двоеточия для соответствия базе
+    oui = mac_address[:8].replace(':', '').lower()
     if oui in oui_database:
         logger.info(f"Производитель для MAC {mac_address} найден в локальной базе")
         return oui_database[oui]
 
     logger.info(f"Производитель для MAC {mac_address} не найден в локальной базе, запрос к API")
-    # Попытка через macvendors.com с учетом лимита 2 запроса/сек
     for attempt in range(API_RETRY_ATTEMPTS):
         try:
             url = f"https://api.macvendors.com/{mac_address}"
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
-                time.sleep(API_DELAY)  # Задержка для соблюдения лимита
+                time.sleep(API_DELAY)
                 return response.text.strip()
             elif response.status_code == 429:
                 logger.warning(f"Попытка {attempt + 1}: Превышен лимит запросов к macvendors.com для MAC {mac_address}")
-                time.sleep(API_DELAY * (attempt + 1))  # Увеличиваем задержку при повторе
+                time.sleep(API_DELAY * (attempt + 1))
             else:
                 logger.warning(
                     f"Попытка {attempt + 1}: Не удалось определить производителя для MAC {mac_address} через macvendors.com (код: {response.status_code})")
         except requests.RequestException as e:
             logger.error(f"Попытка {attempt + 1}: Ошибка запроса к macvendors.com для MAC {mac_address}: {e}")
-        time.sleep(API_DELAY)  # Задержка перед следующей попыткой
+        time.sleep(API_DELAY)
 
-    # Резервный API (maclookup.app)
     try:
         url = f"https://api.maclookup.app/v2/macs/{mac_address}"
         response = requests.get(url, timeout=10)
-        time.sleep(API_DELAY)  # Задержка для единообразия
+        time.sleep(API_DELAY)
         if response.status_code == 200:
             data = response.json()
             return data.get('company', 'Unknown')
@@ -111,23 +111,20 @@ def get_mac_vendor(mac_address, oui_database):
 
 
 def scan_network(ip_range):
-    """Сканирует сеть для получения IP и MAC-адресов."""
-    logger.info(f"Начало сканирования сети {ip_range}")
+    """Сканирует указанную подсеть с помощью широковещательного ARP-запроса."""
+    logger.info(f"Сканирование подсети {ip_range} с помощью широковещательного ARP")
+    devices = []
     arp = ARP(pdst=ip_range)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")  # Широковещательный MAC
+    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
     packet = ether / arp
     try:
         result = srp(packet, timeout=2, verbose=False, multi=True)[0]
+        for sent, received in result:
+            devices.append({"ip": received.psrc, "mac": received.hwsrc, "subnet": ip_range})
+            logger.info(f"Обнаружено устройство в {ip_range}: IP = {received.psrc}, MAC = {received.hwsrc}")
+        logger.info(f"Сканирование подсети {ip_range} завершено. Найдено устройств: {len(devices)}")
     except Exception as e:
-        logger.error(f"Ошибка при сканировании сети: {e}")
-        return []
-
-    devices = []
-    for sent, received in result:
-        devices.append({"ip": received.psrc, "mac": received.hwsrc})
-        logger.info(f"Обнаружено устройство: IP = {received.psrc}, MAC = {received.hwsrc}")
-
-    logger.info(f"Сканирование завершено. Найдено устройств: {len(devices)}")
+        logger.error(f"Ошибка при сканировании подсети {ip_range}: {e}")
     return devices
 
 
@@ -135,43 +132,79 @@ def process_vendor(device, oui_database):
     """Обрабатывает MAC-адрес устройства для определения производителя."""
     vendor = get_mac_vendor(device["mac"], oui_database)
     logger.info(f"MAC {device['mac']} -> Производитель: {vendor}")
-    return vendor
+    return {"mac": device["mac"], "vendor": vendor, "subnet": device["subnet"]}
+
+
+def load_and_filter_results():
+    """Загружает существующие результаты и удаляет записи старше 60 дней."""
+    if os.path.exists(RESULTS_FILE):
+        try:
+            with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
+                results = json.load(f)
+            if not isinstance(results, list):
+                results = [results]
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {RESULTS_FILE}: {e}")
+            return []
+    else:
+        return []
+
+    cutoff_time = datetime.now() - timedelta(seconds=RETENTION_PERIOD)
+    filtered_results = [
+        result for result in results
+        if datetime.strptime(result['date'], "%Y-%m-%d %H:%M:%S") >= cutoff_time
+    ]
+    logger.info(f"Загружено {len(results)} записей, после фильтрации осталось {len(filtered_results)}")
+    return filtered_results
+
+
+def save_results(new_result):
+    """Сохраняет новые результаты, добавляя их к отфильтрованным существующим."""
+    results = load_and_filter_results()
+    results.append(new_result)
+    try:
+        with open(RESULTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=4, ensure_ascii=False)
+        logger.info("Результаты сохранены в network_scan_results.json")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении результатов: {e}")
 
 
 def main():
-    ip_range = "192.168.159.0/24"
+    ip_range = "192.168.159.0/24"  # Указываем одну подсеть для сканирования
 
-    # Загрузка или обновление базы OUI
     oui_database = load_oui_database()
-
-    # Сканирование сети
     devices = scan_network(ip_range)
 
-    # Параллельная обработка запросов к API с учетом лимита
-    vendor_count = {}
-    with ThreadPoolExecutor(max_workers=2) as executor:  # Ограничиваем до 2 потоков для API
-        vendors = list(executor.map(lambda d: process_vendor(d, oui_database), devices))
+    vendor_list = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        vendor_list = list(executor.map(lambda d: process_vendor(d, oui_database), devices))
 
-    for vendor in vendors:
+    vendor_count = {}
+    subnet_vendors = {ip_range: {}}
+    for entry in vendor_list:
+        vendor = entry["vendor"]
+        subnet = entry["subnet"]
         if vendor in vendor_count:
             vendor_count[vendor] += 1
         else:
             vendor_count[vendor] = 1
+        if vendor in subnet_vendors[subnet]:
+            subnet_vendors[subnet][vendor] += 1
+        else:
+            subnet_vendors[subnet][vendor] = 1
 
-    result = {
+    new_result = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "vendors": [
-            {"vendor": vendor, "count": count}
+            {"vendor": vendor, "count": count, "subnets": {
+                subnet: subnet_vendors[subnet].get(vendor, 0) for subnet in [ip_range]
+            }}
             for vendor, count in vendor_count.items()
         ]
     }
 
-    try:
-        with open("network_scan_results.json", "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=4, ensure_ascii=False)
-        logger.info("Результаты сохранены в network_scan_results.json")
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении результатов: {e}")
+    save_results(new_result)
 
 
 if __name__ == "__main__":
